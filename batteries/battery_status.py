@@ -97,29 +97,35 @@ DCB_DATAPOINTS: dict[int, tuple[str, str]] = {
     102: ("battery_status", ""),
 }
 
-# Unverified/community-sourced guesses for additional dcb-category datapoints,
-# not confirmed against Tuya documentation or firmware source. Shown only as
-# a hint alongside the raw value in the "other datapoints" section -- treat
-# the label as a guess, not a fact.
+# Unverified/AI-generated guesses for additional dcb-category datapoints, not
+# confirmed against Tuya documentation, firmware source, or the Lidl/Parkside
+# app. Two independent LLM guesses disagreed on several of these (noted with
+# "or"), which is itself a sign none of this should be trusted without
+# empirical verification (e.g. watch a DP while actually charging/discharging
+# at a known current, or compare against the app's displayed values). Shown
+# only as a hint alongside the raw value in the "other datapoints" section.
 GUESSED_DP_LABELS: dict[int, str] = {
-    2: "charge_current? (mA)",
-    3: "pack_voltage? (mV/10 = V)",
-    8: "charge_cycles?",
-    9: "discharge_cycles?",
-    10: "overcurrent_count?",
-    12: "overheat_alarm?",
-    14: "use_time? (min)",
-    15: "runtime_total? (min)",
-    19: "product_model",
-    21: "fault_bitmap? (0=no fault)",
-    22: "security_switch?",
-    101: "discharge_current?",
-    103: "charge_time_remaining? (min)",
-    104: "runtime_remaining?",
-    105: "work_mode?",
-    106: "anti_theft_pin",
-    113: "voltage_event_count?",
-    116: "max_charge_current_limit? (mA)",
+    2: "current, mA? (0 when idle)",
+    3: "pack voltage, mV/10=V? (e.g. 2520 -> 25.2V or 20.2V)",
+    8: "charge cycles or peak-current indicator?",
+    9: "discharge cycles or event counter?",
+    10: "overcurrent count or charger/dock-connected flag?",
+    12: "overheat/fault alarm (bool)?",
+    14: "charge cycles or use-time (min)?",
+    15: "runtime total (min) or operating hours?",
+    19: "product model (string, e.g. 'PAPS 208 A1')",
+    21: "fault bitmap (0 = no fault)?",
+    22: "security switch or cell-balancing-active (bool)?",
+    101: "discharge current, mA or 0.1A units?",
+    103: "charge time remaining (min) or lock/eco mode?",
+    104: "remaining runtime or remaining capacity (mWh/mAh)?",
+    105: "work/performance mode (enum)?",
+    106: "anti-theft PIN (string)",
+    113: "voltage/cell-imbalance event count or health flag?",
+    114: "cell fault bitfield?",
+    116: "max charge/discharge current limit, mA?",
+    117: "nominal capacity spec or charge timeout?",
+    118: "firmware/BMS logic version?",
 }
 
 
