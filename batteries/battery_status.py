@@ -97,6 +97,31 @@ DCB_DATAPOINTS: dict[int, tuple[str, str]] = {
     102: ("battery_status", ""),
 }
 
+# Unverified/community-sourced guesses for additional dcb-category datapoints,
+# not confirmed against Tuya documentation or firmware source. Shown only as
+# a hint alongside the raw value in the "other datapoints" section -- treat
+# the label as a guess, not a fact.
+GUESSED_DP_LABELS: dict[int, str] = {
+    2: "charge_current? (mA)",
+    3: "pack_voltage? (mV/10 = V)",
+    8: "charge_cycles?",
+    9: "discharge_cycles?",
+    10: "overcurrent_count?",
+    12: "overheat_alarm?",
+    14: "use_time? (min)",
+    15: "runtime_total? (min)",
+    19: "product_model",
+    21: "fault_bitmap? (0=no fault)",
+    22: "security_switch?",
+    101: "discharge_current?",
+    103: "charge_time_remaining? (min)",
+    104: "runtime_remaining?",
+    105: "work_mode?",
+    106: "anti_theft_pin",
+    113: "voltage_event_count?",
+    116: "max_charge_current_limit? (mA)",
+}
+
 
 def load_credentials_from_csv(csv_path: Path) -> list[TuyaBLEDeviceCredentials]:
     credentials = []
@@ -242,10 +267,12 @@ async def read_device_status(
     all_dps = device.datapoints.__dict__()
     other_ids = sorted(set(all_dps) - set(DCB_DATAPOINTS))
     if other_ids:
-        print("  -- other datapoints received --")
+        print("  -- other datapoints received (labels are unverified guesses) --")
         for dp_id in other_ids:
             dp = all_dps[dp_id]
-            print(f"  dp{dp_id:<22d}: {dp.value!r} ({dp.type.name})")
+            guess = GUESSED_DP_LABELS.get(dp_id)
+            tag = f" [{guess}]" if guess else ""
+            print(f"  dp{dp_id:<4d}{tag:35s}: {dp.value!r} ({dp.type.name})")
 
 
 async def main_async(args: argparse.Namespace) -> int:
