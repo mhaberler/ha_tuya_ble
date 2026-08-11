@@ -87,46 +87,55 @@ from bleak import BleakScanner  # noqa: E402
 
 _LOGGER = logging.getLogger("battery_status")
 
-# dp_id -> (label, unit, decoder)
+# dp_id -> (label, unit). Sourced from this repo's own confirmed "dcb" /
+# PARKSIDE Smart battery (product_id ajrhf1aj / z5ztlw3k) mappings in
+# devices.py, sensor.py, binary_sensor.py, switch.py, select.py and
+# number.py/text.py -- not from AI speculation. dp172 (battery_temp_current)
+# is mapped by the integration but these battery units never actually send
+# it, so it always reads n/a here.
 BATTERY_STATUS_OPTIONS = ["Ready", "Charging", "Discharging", "Full", "Sleep", "Error"]
+BATTERY_WORK_MODE_OPTIONS = ["Performance", "Balanced", "Eco", "Expert"]
 
 DCB_DATAPOINTS: dict[int, tuple[str, str]] = {
     16: ("battery_percentage", "%"),
     11: ("temperature", "C"),
     172: ("battery_temp_current", "C"),
     102: ("battery_status", ""),
+    2: ("charge_current", "mA"),
+    3: ("charge_voltage", "mV"),
+    8: ("charge_times", ""),
+    9: ("discharge_times", ""),
+    10: ("peak_current_times", ""),
+    12: ("upper_temp_switch", ""),
+    14: ("use_time", "min"),
+    15: ("runtime_total", "min"),
+    19: ("product_type", ""),
+    21: ("fault", ""),
+    22: ("security_switch", ""),
+    101: ("discharging_current", "mA"),
+    103: ("charge_to_full_time", "min"),
+    104: ("discharge_to_empty_time", "s"),
+    105: ("battery_work_mode", ""),
+    106: ("battery_pin", ""),
+    107: ("over_voltage_times", ""),
+    108: ("under_voltage_times", ""),
+    109: ("overtemp_discharge_times", ""),
+    110: ("overtemp_charge_times", ""),
+    111: ("undertemp_discharge_times", ""),
+    112: ("undertemp_charge_times", ""),
+    113: ("short_circuit_times", ""),
+    114: ("over_current_times", ""),
+    116: ("low_discharge_voltage", "mV"),
+    117: ("discharge_current_limit", "A"),
+    118: ("power_indicator_time", "s"),
 }
 
-# Unverified/AI-generated guesses for additional dcb-category datapoints, not
-# confirmed against Tuya documentation, firmware source, or the Lidl/Parkside
-# app. Two independent LLM guesses disagreed on several of these (noted with
-# "or"), which is itself a sign none of this should be trusted without
-# empirical verification (e.g. watch a DP while actually charging/discharging
-# at a known current, or compare against the app's displayed values). Shown
-# only as a hint alongside the raw value in the "other datapoints" section.
-GUESSED_DP_LABELS: dict[int, str] = {
-    2: "current, mA? (0 when idle)",
-    3: "pack voltage, mV/10=V? (e.g. 2520 -> 25.2V or 20.2V)",
-    8: "charge cycles or peak-current indicator?",
-    9: "discharge cycles or event counter?",
-    10: "overcurrent count or charger/dock-connected flag?",
-    12: "overheat/fault alarm (bool)?",
-    14: "charge cycles or use-time (min)?",
-    15: "runtime total (min) or operating hours?",
-    19: "product model (string, e.g. 'PAPS 208 A1')",
-    21: "fault bitmap (0 = no fault)?",
-    22: "security switch or cell-balancing-active (bool)?",
-    101: "discharge current, mA or 0.1A units?",
-    103: "charge time remaining (min) or lock/eco mode?",
-    104: "remaining runtime or remaining capacity (mWh/mAh)?",
-    105: "work/performance mode (enum)?",
-    106: "anti-theft PIN (string)",
-    113: "voltage/cell-imbalance event count or health flag?",
-    114: "cell fault bitfield?",
-    116: "max charge/discharge current limit, mA?",
-    117: "nominal capacity spec or charge timeout?",
-    118: "firmware/BMS logic version?",
-}
+# Small "core" subset the wait-for-datapoints loop blocks on. Everything else
+# in DCB_DATAPOINTS is displayed opportunistically but not waited for -- some
+# DPs (e.g. 172) are mapped by the integration for this category but simply
+# never sent by these particular battery units, so waiting on the full set
+# would always burn the whole timeout.
+CORE_DATAPOINTS = (16, 11, 102)
 
 
 def load_credentials_from_csv(csv_path: Path) -> list[TuyaBLEDeviceCredentials]:
@@ -226,6 +235,8 @@ def format_value(dp_id: int, dp) -> str:
     value = dp.value
     if dp_id == 102 and isinstance(value, int) and 0 <= value < len(BATTERY_STATUS_OPTIONS):
         value = BATTERY_STATUS_OPTIONS[value]
+    elif dp_id == 105 and isinstance(value, int) and 0 <= value < len(BATTERY_WORK_MODE_OPTIONS):
+        value = BATTERY_WORK_MODE_OPTIONS[value]
     return f"{value}{unit}"
 
 
@@ -257,7 +268,7 @@ async def read_device_status(
         loop = asyncio.get_event_loop()
         deadline = loop.time() + dp_wait_timeout
         while loop.time() < deadline:
-            if all(device.datapoints[dp_id] is not None for dp_id in DCB_DATAPOINTS):
+            if all(device.datapoints[dp_id] is not None for dp_id in CORE_DATAPOINTS):
                 break
             await asyncio.sleep(0.5)
     except Exception as ex:  # noqa: BLE001
@@ -266,19 +277,28 @@ async def read_device_status(
     finally:
         await device.stop()
 
-    for dp_id, (label, unit) in DCB_DATAPOINTS.items():
-        dp = device.datapoints[dp_id]
-        print(f"  {label:24s}: {format_value(dp_id, dp)}")
-
     all_dps = device.datapoints.__dict__()
-    other_ids = sorted(set(all_dps) - set(DCB_DATAPOINTS))
-    if other_ids:
-        print("  -- other datapoints received (labels are unverified guesses) --")
-        for dp_id in other_ids:
+
+    print("  -- core --")
+    for dp_id in CORE_DATAPOINTS:
+        label = DCB_DATAPOINTS[dp_id][0]
+        print(f"  {label:24s}: {format_value(dp_id, all_dps.get(dp_id))}")
+
+    known_diagnostic_ids = [
+        dp_id for dp_id in DCB_DATAPOINTS if dp_id not in CORE_DATAPOINTS and dp_id in all_dps
+    ]
+    if known_diagnostic_ids:
+        print("  -- other known datapoints --")
+        for dp_id in known_diagnostic_ids:
+            label = DCB_DATAPOINTS[dp_id][0]
+            print(f"  {label:24s}: {format_value(dp_id, all_dps.get(dp_id))}")
+
+    unknown_ids = sorted(set(all_dps) - set(DCB_DATAPOINTS))
+    if unknown_ids:
+        print("  -- unrecognized datapoints (no label mapping in this repo) --")
+        for dp_id in unknown_ids:
             dp = all_dps[dp_id]
-            guess = GUESSED_DP_LABELS.get(dp_id)
-            tag = f" [{guess}]" if guess else ""
-            print(f"  dp{dp_id:<4d}{tag:35s}: {dp.value!r} ({dp.type.name})")
+            print(f"  dp{dp_id:<4d}: {dp.value!r} ({dp.type.name})")
 
 
 async def main_async(args: argparse.Namespace) -> int:
