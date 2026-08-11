@@ -112,6 +112,20 @@ _LOGGER = logging.getLogger("battery_status")
 # number.py/text.py -- not from AI speculation. dp172 (battery_temp_current)
 # is mapped by the integration but these battery units never actually send
 # it, so it always reads n/a here.
+#
+# dp3 (charge_voltage) is a known bug in this repo's own sensor.py: it's
+# mapped with no coefficient (defaults to 1.0), reporting the raw value
+# directly as millivolts -- but the raw value is actually ~8x too small
+# (e.g. 2520 for a battery labeled "20V", i.e. 2.52V, physically implausible
+# for a 5S Li-ion pack). Cross-checked against an independent third-party
+# reimplementation (github.com/MrTup1/Parkside-Bluetooth), which documents a
+# x8 scaling factor; raw*8 lands at 19.6-20.3V across multiple real captures
+# from this user's batteries, matching the "20V" pack rating. DCB_VOLTAGE_DP
+# below applies that factor; DCB_DATAPOINTS' unit label stays "mV" since the
+# corrected *value* is already in millivolts after scaling.
+DCB_VOLTAGE_DP = 3
+DCB_VOLTAGE_SCALE = 8
+
 BATTERY_STATUS_OPTIONS = ["Ready", "Charging", "Discharging", "Full", "Sleep", "Error"]
 BATTERY_WORK_MODE_OPTIONS = ["Performance", "Balanced", "Eco", "Expert"]
 
@@ -133,6 +147,12 @@ DCB_DATAPOINTS: dict[int, tuple[str, str]] = {
     22: ("security_switch", ""),
     101: ("discharging_current", "mA"),
     103: ("charge_to_full_time", "min"),
+    # unit uncertain: this repo's sensor.py says seconds; a third-party
+    # reimplementation (MrTup1/Parkside-Bluetooth) says minutes "capped at
+    # 30720" and calls it estimated remaining life, not time-to-empty. Real
+    # captured value 29184 at 94% battery is 8.1h as seconds (plausible
+    # remaining runtime) vs ~486h/20 days as minutes (implausible) -- seconds
+    # interpretation kept as more physically sensible, but unconfirmed either way.
     104: ("discharge_to_empty_time", "s"),
     105: ("battery_work_mode", ""),
     106: ("battery_pin", ""),
@@ -342,7 +362,9 @@ def format_value(dp_id: int, dp) -> str:
         return "n/a"
     label, unit = DCB_DATAPOINTS.get(dp_id, (str(dp_id), ""))
     value = dp.value
-    if dp_id == 102 and isinstance(value, int) and 0 <= value < len(BATTERY_STATUS_OPTIONS):
+    if dp_id == DCB_VOLTAGE_DP and isinstance(value, int):
+        value = value * DCB_VOLTAGE_SCALE
+    elif dp_id == 102 and isinstance(value, int) and 0 <= value < len(BATTERY_STATUS_OPTIONS):
         value = BATTERY_STATUS_OPTIONS[value]
     elif dp_id == 105 and isinstance(value, int) and 0 <= value < len(BATTERY_WORK_MODE_OPTIONS):
         value = BATTERY_WORK_MODE_OPTIONS[value]
