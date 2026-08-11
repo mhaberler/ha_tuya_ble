@@ -8,19 +8,23 @@ subpackage has no Home Assistant dependency itself, but its *parent* package
 (custom_components/tuya_ble/__init__.py) does, so it is loaded directly from
 its file path rather than via a normal package import.
 
-Credentials (uuid, local_key, device_id/"id", category, product_id) are read
-from a Tuya IoT export CSV such as batteries/tuya-local-key (1).csv.
+Only uuid, local_key, id ("device_id") and (if present) sec_key are read from
+the Tuya IoT export CSV (see load_credentials_from_csv) -- everything else in
+such an export (category, product_id, timestamps, etc.) is either unused by
+the wire protocol or only needed by the real HA integration's UI layer, not
+by this script.
 
 Devices are identified without relying on the CSV containing a MAC address
 (it doesn't have a "mac" column): every Tuya BLE advertisement broadcasts an
-AES-encrypted UUID that decrypts using nothing but the device's product_id
-(MD5(product_id) as both AES key and IV -- see decrypt_advertised_uuid()).
-Each scanned advertisement is decrypted with every known product_id from the
-CSV and matched against the CSV's uuid column; a match tells us which CSV row
-a given (possibly unknown, possibly rotating) MAC address belongs to. This is
+AES-encrypted UUID, decryptable using key material the advertisement itself
+carries (MD5 of 8 raw bytes from its service-data field, used as both AES key
+and IV -- see decrypt_advertised_uuid()). The decrypted result is looked up
+directly against the CSV's uuid column; a match tells us which CSV row a
+given (possibly unknown, possibly rotating) MAC address belongs to. This is
 the same mechanism this repo's own tuya_ble.py uses internally
 (_decode_advertisement_data) and the one documented in ARDUINO.md for a
-future ESP32 port -- see that file for the full protocol writeup.
+future ESP32 port -- see that file for the full protocol writeup, including
+empirical verification against a real captured advertisement.
 
 Usage:
     ./battery_status.py                      # scan + read all devices in the CSV
@@ -154,6 +158,17 @@ CORE_DATAPOINTS = (16, 11, 102)
 
 
 def load_credentials_from_csv(csv_path: Path) -> list[TuyaBLEDeviceCredentials]:
+    """Load the fields the BLE protocol actually needs from a Tuya export CSV.
+
+    Only uuid, local_key and id (-> device_id) are used by the pairing/session
+    crypto (see TuyaBLEDevice._build_pairing_request and
+    TuyaBLESecurityMaterial), plus sec_key if present (switches key derivation
+    to protocol-v2). category/product_id/product_name are read by the real HA
+    integration only to pick UI sensor mappings, which this script doesn't
+    use -- battery_status.py's own DCB_DATAPOINTS table covers that instead --
+    so they're filled with placeholders here rather than sourced from the CSV.
+    device_name is kept purely for display in this script's output.
+    """
     credentials = []
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -162,13 +177,14 @@ def load_credentials_from_csv(csv_path: Path) -> list[TuyaBLEDeviceCredentials]:
                 uuid=row["uuid"],
                 local_key=row["local_key"],
                 device_id=row["id"],
-                category=row["category"],
-                product_id=row["product_id"],
-                device_name=row["name"],
+                category="",
+                product_id="",
+                device_name=row.get("name"),
                 product_model=None,
-                product_name=row.get("product_name"),
+                product_name=None,
                 functions=[],
                 status_range=[],
+                sec_key=row.get("sec_key") or None,
             )
             credentials.append(creds)
     return credentials
