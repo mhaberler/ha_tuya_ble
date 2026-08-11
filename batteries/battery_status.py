@@ -202,10 +202,19 @@ def decrypt_advertised_uuid(raw_product_id: bytes, encrypted_uuid: bytes) -> str
     """Decrypt the UUID a Tuya BLE device broadcasts in its advertisement.
 
     Mirrors TuyaBLEDevice._decode_advertisement_data (tuya_ble.py): the AES-128
-    key is MD5(product_id), used as both the key AND the IV (a Tuya-specific
-    quirk for this one advertisement field -- the main session protocol uses a
-    proper random IV). Returns None if the bytes don't decode as UTF-8 (wrong
-    product_id guess, or not a Tuya advertisement at all).
+    key is MD5(raw_product_id), used as both the key AND the IV (a
+    Tuya-specific quirk for this one advertisement field -- the main session
+    protocol uses a proper random IV).
+
+    IMPORTANT: raw_product_id here is the *raw 8 bytes broadcast in the
+    advertisement's service_data* -- NOT the ASCII product_id string from the
+    CSV (e.g. "ajrhf1aj"). Those are different values; an earlier version of
+    this function mistakenly tried CSV product_id strings as the key and
+    always failed. Verified empirically against a real captured
+    advertisement: MD5(advertised 8 bytes) correctly decrypts to the exact
+    uuid string from that device's CSV row. The advertisement is
+    self-describing -- no CSV lookup is needed to derive the key, only to
+    check the *result* against known uuids.
     """
     key = hashlib.md5(raw_product_id, usedforsecurity=False).digest()
     cipher = AES.new(key, AES.MODE_CBC, key)
@@ -242,30 +251,26 @@ def extract_advertised_identity(advertisement_data) -> tuple[bytes, bytes] | Non
 
 def match_credentials_by_uuid(
     advertisement_data,
-    credentials_by_product_id: dict[str, list[TuyaBLEDeviceCredentials]],
+    credentials_by_uuid: dict[str, TuyaBLEDeviceCredentials],
 ) -> TuyaBLEDeviceCredentials | None:
     """Identify which known device (if any) sent this advertisement.
 
-    No MAC address is used or needed: the advertisement's encrypted UUID is
-    decrypted using every candidate product_id from the CSV and compared
-    against each candidate's known uuid. This is the general-purpose approach
-    documented in ARDUINO.md, adopted here instead of parsing a MAC out of
-    the CSV "name" column (which happened to work only because this
+    No MAC address is used or needed: the advertisement carries its own key
+    material (raw_product_id bytes), which decrypts directly to the device's
+    uuid -- look that up in the CSV-derived table. This is the general-purpose
+    approach documented in ARDUINO.md, adopted here instead of parsing a MAC
+    out of the CSV "name" column (which happened to work only because this
     particular export embeds it there).
     """
     identity = extract_advertised_identity(advertisement_data)
     if identity is None:
         return None
-    _advertised_product_id, encrypted_uuid = identity
+    raw_product_id, encrypted_uuid = identity
 
-    for product_id, candidates in credentials_by_product_id.items():
-        decrypted_uuid = decrypt_advertised_uuid(product_id.encode("ascii"), encrypted_uuid)
-        if decrypted_uuid is None:
-            continue
-        for creds in candidates:
-            if creds.uuid == decrypted_uuid:
-                return creds
-    return None
+    decrypted_uuid = decrypt_advertised_uuid(raw_product_id, encrypted_uuid)
+    if decrypted_uuid is None:
+        return None
+    return credentials_by_uuid.get(decrypted_uuid)
 
 
 class LiveScanner:
@@ -286,14 +291,14 @@ class LiveScanner:
     rotates.
     """
 
-    def __init__(self, credentials_by_product_id: dict[str, list[TuyaBLEDeviceCredentials]]) -> None:
-        self._credentials_by_product_id = credentials_by_product_id
+    def __init__(self, credentials_by_uuid: dict[str, TuyaBLEDeviceCredentials]) -> None:
+        self._credentials_by_uuid = credentials_by_uuid
         self._resolved_by_uuid: dict[str, tuple[TuyaBLEDeviceCredentials, str, object, object]] = {}
         self._scanner = BleakScanner(self._callback)
 
     def _callback(self, device, advertisement_data) -> None:
         mac = device.address.upper()
-        creds = match_credentials_by_uuid(advertisement_data, self._credentials_by_product_id)
+        creds = match_credentials_by_uuid(advertisement_data, self._credentials_by_uuid)
         if creds is not None:
             self._resolved_by_uuid[creds.uuid] = (creds, mac, device, advertisement_data)
 
@@ -402,16 +407,16 @@ async def main_async(args: argparse.Namespace) -> int:
     print(f"Loading credentials from {csv_path}")
     credentials_list = load_credentials_from_csv(csv_path)
 
-    # Grouped by product_id (not by mac -- the CSV has no mac column) so
-    # match_credentials_by_uuid can try every candidate product_id's derived
-    # AES key against a scanned advertisement's encrypted uuid.
-    credentials_by_product_id: dict[str, list[TuyaBLEDeviceCredentials]] = {}
-    for creds in credentials_list:
-        credentials_by_product_id.setdefault(creds.product_id, []).append(creds)
+    # Keyed by uuid (not by mac -- the CSV has no mac column). Each
+    # advertisement decrypts directly to a uuid using its own broadcast key
+    # material, so this is a plain lookup, not something to search/guess.
+    credentials_by_uuid: dict[str, TuyaBLEDeviceCredentials] = {
+        creds.uuid: creds for creds in credentials_list
+    }
 
     manager = StaticDeviceManager()
 
-    scanner = LiveScanner(credentials_by_product_id)
+    scanner = LiveScanner(credentials_by_uuid)
     await scanner.start()
     try:
         _LOGGER.info(

@@ -32,12 +32,15 @@ Assistant's own OS-level bluetooth manager already hands it a `BLEDevice`
 keyed by address). The real device-identification mechanism is already
 implemented in `_decode_advertisement_data` (`tuya_ble.py:432-464`): every
 Tuya BLE advertisement broadcasts an **encrypted UUID**, decryptable using
-nothing but the device's `product_id` (present in the CSV) — see "Device
-discovery without MAC" below. This means the firmware can scan for *any*
-nearby Tuya device, decrypt each one's advertised UUID using every
-`product_id` in the NVS table, and match against the CSV's `uuid` column to
-identify which physical device it found — independent of MAC, and robust even
-if a device's MAC changes.
+key material the *advertisement itself carries* (an opaque 8-byte value in
+the service-data field — **not** the CSV's ASCII `product_id` string; those
+are two different values, confirmed by testing both against a real captured
+advertisement, see "Device discovery without MAC" below). This means the
+firmware can scan for *any* nearby Tuya device, derive the decrypt key
+straight from that device's own advertisement, and compare the decrypted
+result against the CSV's `uuid` column — no CSV lookup or guessing is needed
+to derive the key, only to check the decrypted uuid against known devices —
+independent of MAC, and robust even if a device's MAC changes.
 
 **Connection-management code must be redesigned, not ported.** The Python
 `_ensure_connected`/`_release_client`/`_release_and_reconnect` logic
@@ -53,38 +56,69 @@ resist porting.
 
 ## Device discovery without MAC (advertisement UUID decrypt-and-match)
 
-Verified against `tuya_ble.py:432-464`. This is the mechanism that makes
+Verified against `tuya_ble.py:432-464`, **and against a real captured
+advertisement** from one of this user's batteries (not just source-reading —
+see "Empirical verification" below). This is the mechanism that makes
 MAC-free operation possible, and needs to run as a scan phase *before* the
 GATT-connect/pairing handshake described below. `batteries/battery_status.py`
-adopts this same approach (see its `resolve_device_credentials` /
-`decrypt_advertised_uuid`-equivalent logic) rather than parsing a MAC out of
-the CSV's `name` column, so the Python script and this firmware plan now agree
-on one general-purpose device-identification strategy.
+adopts this same approach (`match_credentials_by_uuid`/
+`decrypt_advertised_uuid`) rather than parsing a MAC out of the CSV's `name`
+column, so the Python script and this firmware plan now agree on one
+general-purpose device-identification strategy.
+
+**Important correction**: the key material is **not** the CSV's ASCII
+`product_id` string (e.g. `"ajrhf1aj"`). An earlier version of this plan and
+of `battery_status.py` assumed that and it silently never matched anything.
+The advertisement's service-data field carries its own opaque 8 raw bytes —
+call them `raw_product_id` since that's the variable name `tuya_ble.py` uses,
+but they are not equal to, and cannot be derived from, the CSV `product_id`
+column. The advertisement is fully self-describing: use whatever bytes it
+broadcasts as the key, and only consult the CSV afterward, to check the
+*decrypted result* against known `uuid` values.
 
 1. Scan BLE advertisements for the Tuya service UUID (`0000a201-...` or
    `0000fd50-...`, `const.py` `SERVICE_UUIDS`). Each matching advertisement's
-   **service data** field carries `[0x00, product_id_bytes...]` (byte 0 is a
+   **service data** field carries `[0x00, raw_product_id(8B)...]` (byte 0 is a
    sub-type tag; `0` = product ID present, per `tuya_ble.py:446-448`) and its
    **manufacturer data** (company ID `0x07D0`, `MANUFACTURER_DATA_ID` in
    `const.py`) carries `[flags(1B), protocol_version(1B), reserved(4B),
    encrypted_uuid(rest)]`.
-2. For the current advertisement's `raw_product_id`, compute
-   `key = MD5(raw_product_id)`.
+2. Compute `key = MD5(raw_product_id)` using the 8 bytes taken directly from
+   this advertisement's own service-data — no CSV/NVS table involved yet.
 3. Decrypt `encrypted_uuid` with **AES-128-CBC using `key` as both the key
    and the IV** (`AES.new(key, AES.MODE_CBC, key)`,
    `tuya_ble.py:462-463` — this key==IV construction is specific to this one
    advertisement-decrypt step; the main session protocol below uses a proper
    random IV). Result decodes as a UTF-8 `uuid` string.
-4. Look up that decrypted `uuid` in the NVS JSON table (built from the CSV).
-   A match tells the firmware: this advertisement, from whatever MAC it
-   currently has, is CSV row N — use that row's `local_key`/`device_id`/
-   `product_id`/`sec_key` for the pairing handshake, and the advertisement's
-   *current* MAC for the GATT connect.
-5. No match → not one of our devices, ignore and keep scanning.
+4. Look up that decrypted `uuid` in the NVS JSON table (built from the CSV) —
+   this is the only step that touches the CSV data. A match tells the
+   firmware: this advertisement, from whatever MAC it currently has, is CSV
+   row N — use that row's `local_key`/`device_id`/`product_id`/`sec_key` for
+   the pairing handshake, and the advertisement's *current* MAC for the GATT
+   connect.
+5. No match (wrong UTF-8 decode, or decodes but isn't in the table) → not one
+   of our devices, ignore and keep scanning.
 
 This step only needs to run once per device per power-up/reconnect (to learn
 its current MAC), not on every read cycle — cache the MAC after a successful
 match for the rest of that session.
+
+### Empirical verification
+
+Confirmed against a live capture, not just source inspection. A real
+advertisement from a Parkside 8Ah battery (CSV uuid `4abe2e2deb1b976f`,
+product_id `ajrhf1aj`) was captured with `bleak`:
+```
+service_data:      00 a8 05 b3 41 d5 ab f9 95   (raw_product_id = a8 05 b3 41 d5 ab f9 95)
+manufacturer_data:  80 03 00 00 01 00 d8 8d 56 d8 4d 41 58 26 5e 05 fb c9 71 08 7c 63
+                    (encrypted_uuid = d8 8d 56 d8 4d 41 58 26 5e 05 fb c9 71 08 7c 63)
+```
+`MD5(a8 05 b3 41 d5 ab f9 95)` used as AES-128-CBC key+IV decrypts
+`encrypted_uuid` to the ASCII string `4abe2e2deb1b976f` — an exact match to
+that device's CSV `uuid` column. Trying `MD5("ajrhf1aj")` (the CSV
+product_id string) instead produces garbage, not valid UTF-8 — confirming the
+two byte sequences are unrelated and the advertisement's own bytes are the
+only correct key source.
 
 ## Protocol facts to carry into the C++ port (verified against source)
 
@@ -184,11 +218,12 @@ six Python files.
    (already the de facto standard on this platform) into an in-memory array
    of credential structs.
 2. **Scan phase before connect** (see "Device discovery without MAC" above):
-   on boot/reconnect, run a NimBLE scan, decrypt each candidate
-   advertisement's UUID using every `product_id` in the NVS table until one
-   matches a known `uuid`, and record that advertisement's current MAC
-   against the matched credential-table row. Repeat per device if reading
-   multiple batteries in one firmware.
+   on boot/reconnect, run a NimBLE scan, and for each candidate advertisement
+   derive the decrypt key from its *own* service-data bytes (not from the NVS
+   table), decrypt its uuid, and check that single result against the NVS
+   table — an O(1) lookup, not a search over known product_ids. Record the
+   matched advertisement's current MAC against the matched credential-table
+   row. Repeat per device if reading multiple batteries in one firmware.
 3. **Single-connection, blocking/polling design per device**: simple state
    machine (`DISCONNECTED → CONNECTING → AWAITING_DEVICE_INFO →
    AWAITING_PAIR_ACK → PAIRED → AWAITING_STATUS`), driven from `loop()` with a
