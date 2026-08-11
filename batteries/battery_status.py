@@ -11,6 +11,17 @@ its file path rather than via a normal package import.
 Credentials (uuid, local_key, device_id/"id", category, product_id) are read
 from a Tuya IoT export CSV such as batteries/tuya-local-key (1).csv.
 
+Devices are identified without relying on the CSV containing a MAC address
+(it doesn't have a "mac" column): every Tuya BLE advertisement broadcasts an
+AES-encrypted UUID that decrypts using nothing but the device's product_id
+(MD5(product_id) as both AES key and IV -- see decrypt_advertised_uuid()).
+Each scanned advertisement is decrypted with every known product_id from the
+CSV and matched against the CSV's uuid column; a match tells us which CSV row
+a given (possibly unknown, possibly rotating) MAC address belongs to. This is
+the same mechanism this repo's own tuya_ble.py uses internally
+(_decode_advertisement_data) and the one documented in ARDUINO.md for a
+future ESP32 port -- see that file for the full protocol writeup.
+
 Usage:
     ./battery_status.py                      # scan + read all devices in the CSV
     ./battery_status.py --csv path/to.csv
@@ -24,6 +35,7 @@ import asyncio
 import csv
 import enum
 import glob
+import hashlib
 import importlib.util
 import logging
 import sys
@@ -84,6 +96,9 @@ TuyaBLEDeviceCredentials = tuya_ble.TuyaBLEDeviceCredentials
 SERVICE_UUIDS = tuya_ble.SERVICE_UUIDS
 
 from bleak import BleakScanner  # noqa: E402
+from Crypto.Cipher import AES  # noqa: E402
+
+MANUFACTURER_DATA_ID = tuya_ble.const.MANUFACTURER_DATA_ID
 
 _LOGGER = logging.getLogger("battery_status")
 
@@ -160,10 +175,19 @@ def load_credentials_from_csv(csv_path: Path) -> list[TuyaBLEDeviceCredentials]:
 
 
 class StaticDeviceManager(AbstaractTuyaBLEDeviceManager):
-    """Serves credentials parsed from the CSV export, keyed by BLE MAC address."""
+    """Serves credentials parsed from the CSV export, keyed by BLE MAC address.
 
-    def __init__(self, address_to_credentials: dict[str, TuyaBLEDeviceCredentials]):
-        self._address_to_credentials = address_to_credentials
+    The MAC a given device is currently using is not known upfront (the CSV
+    has no mac column) -- entries are registered dynamically once
+    match_credentials_by_uuid() identifies which CSV row a scanned
+    advertisement belongs to.
+    """
+
+    def __init__(self) -> None:
+        self._address_to_credentials: dict[str, TuyaBLEDeviceCredentials] = {}
+
+    def register(self, address: str, credentials: TuyaBLEDeviceCredentials) -> None:
+        self._address_to_credentials[address.upper()] = credentials
 
     async def get_device_credentials(
         self,
@@ -174,18 +198,73 @@ class StaticDeviceManager(AbstaractTuyaBLEDeviceManager):
         return self._address_to_credentials.get(address.upper())
 
 
-def extract_mac_from_name(name: str) -> str | None:
-    """Pull the trailing MAC address out of a Tuya-exported device name.
+def decrypt_advertised_uuid(raw_product_id: bytes, encrypted_uuid: bytes) -> str | None:
+    """Decrypt the UUID a Tuya BLE device broadcasts in its advertisement.
 
-    The CSV names embed the BLE MAC, e.g. "Lidl Smart battery 8Ah DC:23:4D:EB:88:46".
+    Mirrors TuyaBLEDevice._decode_advertisement_data (tuya_ble.py): the AES-128
+    key is MD5(product_id), used as both the key AND the IV (a Tuya-specific
+    quirk for this one advertisement field -- the main session protocol uses a
+    proper random IV). Returns None if the bytes don't decode as UTF-8 (wrong
+    product_id guess, or not a Tuya advertisement at all).
     """
-    parts = name.strip().split()
-    if not parts:
+    key = hashlib.md5(raw_product_id, usedforsecurity=False).digest()
+    cipher = AES.new(key, AES.MODE_CBC, key)
+    try:
+        return cipher.decrypt(encrypted_uuid).decode("utf-8")
+    except UnicodeDecodeError:
         return None
-    candidate = parts[-1]
-    octets = candidate.split(":")
-    if len(octets) == 6 and all(len(o) == 2 for o in octets):
-        return candidate.upper()
+
+
+def extract_advertised_identity(advertisement_data) -> tuple[bytes, bytes] | None:
+    """Pull (raw_product_id, encrypted_uuid) out of a Tuya BLE advertisement.
+
+    Mirrors TuyaBLEDevice._decode_advertisement_data (tuya_ble.py:432-464).
+    Returns None if this advertisement doesn't carry both fields (e.g. it's
+    not a Tuya device, or is missing manufacturer/service data this scan).
+    """
+    raw_product_id: bytes | None = None
+    if advertisement_data.service_data:
+        for service_uuid in SERVICE_UUIDS:
+            service_data = advertisement_data.service_data.get(service_uuid)
+            if service_data and len(service_data) > 1 and service_data[0] == 0:
+                raw_product_id = service_data[1:]
+                break
+    if raw_product_id is None:
+        return None
+
+    manufacturer_data = (advertisement_data.manufacturer_data or {}).get(MANUFACTURER_DATA_ID)
+    if not manufacturer_data or len(manufacturer_data) <= 6:
+        return None
+    encrypted_uuid = manufacturer_data[6:]
+
+    return raw_product_id, encrypted_uuid
+
+
+def match_credentials_by_uuid(
+    advertisement_data,
+    credentials_by_product_id: dict[str, list[TuyaBLEDeviceCredentials]],
+) -> TuyaBLEDeviceCredentials | None:
+    """Identify which known device (if any) sent this advertisement.
+
+    No MAC address is used or needed: the advertisement's encrypted UUID is
+    decrypted using every candidate product_id from the CSV and compared
+    against each candidate's known uuid. This is the general-purpose approach
+    documented in ARDUINO.md, adopted here instead of parsing a MAC out of
+    the CSV "name" column (which happened to work only because this
+    particular export embeds it there).
+    """
+    identity = extract_advertised_identity(advertisement_data)
+    if identity is None:
+        return None
+    _advertised_product_id, encrypted_uuid = identity
+
+    for product_id, candidates in credentials_by_product_id.items():
+        decrypted_uuid = decrypt_advertised_uuid(product_id.encode("ascii"), encrypted_uuid)
+        if decrypted_uuid is None:
+            continue
+        for creds in candidates:
+            if creds.uuid == decrypted_uuid:
+                return creds
     return None
 
 
@@ -198,14 +277,25 @@ class LiveScanner:
     even moments after a successful discovery). Keeping one scanner running
     continuously -- across discovery *and* every connect attempt -- avoids
     that gap, mirroring how Home Assistant's own bluetooth manager works.
+
+    Every advertisement is also checked against the known-device credential
+    table by decrypting its broadcast UUID (see match_credentials_by_uuid) --
+    no MAC address needs to be known ahead of time. Resolved devices are
+    tracked by uuid (the CSV's stable identity), with the MAC address learned
+    on the fly and updated on every subsequent advertisement in case it
+    rotates.
     """
 
-    def __init__(self) -> None:
-        self._found: dict[str, tuple[object, object]] = {}
+    def __init__(self, credentials_by_product_id: dict[str, list[TuyaBLEDeviceCredentials]]) -> None:
+        self._credentials_by_product_id = credentials_by_product_id
+        self._resolved_by_uuid: dict[str, tuple[TuyaBLEDeviceCredentials, str, object, object]] = {}
         self._scanner = BleakScanner(self._callback)
 
     def _callback(self, device, advertisement_data) -> None:
-        self._found[device.address.upper()] = (device, advertisement_data)
+        mac = device.address.upper()
+        creds = match_credentials_by_uuid(advertisement_data, self._credentials_by_product_id)
+        if creds is not None:
+            self._resolved_by_uuid[creds.uuid] = (creds, mac, device, advertisement_data)
 
     async def start(self) -> None:
         await self._scanner.start()
@@ -213,19 +303,17 @@ class LiveScanner:
     async def stop(self) -> None:
         await self._scanner.stop()
 
-    def get(self, mac: str) -> tuple[object, object] | None:
-        return self._found.get(mac.upper())
-
-    async def wait_for(self, mac: str, timeout: float) -> tuple[object, object] | None:
-        mac = mac.upper()
+    async def wait_for_uuid(
+        self, uuid: str, timeout: float
+    ) -> tuple[TuyaBLEDeviceCredentials, str, object, object] | None:
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            entry = self._found.get(mac)
+            entry = self._resolved_by_uuid.get(uuid)
             if entry:
                 return entry
             await asyncio.sleep(0.25)
-        return self._found.get(mac)
+        return self._resolved_by_uuid.get(uuid)
 
 
 def format_value(dp_id: int, dp) -> str:
@@ -241,20 +329,23 @@ def format_value(dp_id: int, dp) -> str:
 
 
 async def read_device_status(
-    credentials: TuyaBLEDeviceCredentials,
-    mac: str,
+    uuid: str,
     manager: StaticDeviceManager,
     scanner: LiveScanner,
     resolve_timeout: float,
     dp_wait_timeout: float,
 ) -> None:
+    resolved = await scanner.wait_for_uuid(uuid, resolve_timeout)
+    if resolved is None:
+        print(f"\n=== uuid={uuid} ===\n  ERROR: device not found in a fresh scan (out of range?)")
+        return
+    credentials, mac, ble_device, advertisement_data = resolved
     print(f"\n=== {credentials.device_name} ({mac}) ===")
 
-    resolved = await scanner.wait_for(mac, resolve_timeout)
-    if resolved is None:
-        print(f"  ERROR: device not found in a fresh scan (out of range?)")
-        return
-    ble_device, advertisement_data = resolved
+    # Advertisement decryption identified which CSV row this MAC belongs to;
+    # register it so TuyaBLEDevice.initialize() -> get_device_credentials(mac)
+    # resolves to the right credentials for the actual pairing handshake.
+    manager.register(mac, credentials)
 
     device = TuyaBLEDevice(manager, ble_device, advertisement_data)
     await device.initialize()
@@ -311,44 +402,42 @@ async def main_async(args: argparse.Namespace) -> int:
     print(f"Loading credentials from {csv_path}")
     credentials_list = load_credentials_from_csv(csv_path)
 
-    mac_to_credentials: dict[str, TuyaBLEDeviceCredentials] = {}
+    # Grouped by product_id (not by mac -- the CSV has no mac column) so
+    # match_credentials_by_uuid can try every candidate product_id's derived
+    # AES key against a scanned advertisement's encrypted uuid.
+    credentials_by_product_id: dict[str, list[TuyaBLEDeviceCredentials]] = {}
     for creds in credentials_list:
-        mac = extract_mac_from_name(creds.device_name or "")
-        if mac:
-            mac_to_credentials[mac] = creds
-        else:
-            _LOGGER.warning("Could not extract MAC address from name %r", creds.device_name)
+        credentials_by_product_id.setdefault(creds.product_id, []).append(creds)
 
-    manager = StaticDeviceManager(mac_to_credentials)
+    manager = StaticDeviceManager()
 
-    scanner = LiveScanner()
+    scanner = LiveScanner(credentials_by_product_id)
     await scanner.start()
     try:
         _LOGGER.info(
             "Scanning for BLE advertisements for up to %.0fs per device "
             "(these batteries only advertise intermittently, e.g. after being "
-            "touched or docked) ...",
+            "touched or docked); devices are identified by decrypting their "
+            "advertised uuid, no MAC address needed ...",
             args.timeout,
         )
 
-        in_range = []
-        for mac, creds in mac_to_credentials.items():
-            if await scanner.wait_for(mac, args.timeout):
-                in_range.append((mac, creds))
+        resolved_uuids = []
+        for creds in credentials_list:
+            if await scanner.wait_for_uuid(creds.uuid, args.timeout):
+                resolved_uuids.append(creds.uuid)
             else:
-                print(f"Not seen during scan: {creds.device_name} ({mac})")
+                print(f"Not seen during scan: {creds.device_name} (uuid={creds.uuid})")
 
-        if not in_range:
+        if not resolved_uuids:
             print(
                 "\nNo known devices were found in range. Wake them (press the "
                 "button / dock them) and try again, or increase --timeout."
             )
             return 1
 
-        for mac, creds in in_range:
-            await read_device_status(
-                creds, mac, manager, scanner, args.resolve_timeout, args.dp_wait_timeout
-            )
+        for uuid in resolved_uuids:
+            await read_device_status(uuid, manager, scanner, args.resolve_timeout, args.dp_wait_timeout)
     finally:
         await scanner.stop()
 
