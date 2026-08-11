@@ -93,9 +93,10 @@ broadcasts as the key, and only consult the CSV afterward, to check the
 4. Look up that decrypted `uuid` in the NVS JSON table (built from the CSV) —
    this is the only step that touches the CSV data. A match tells the
    firmware: this advertisement, from whatever MAC it currently has, is CSV
-   row N — use that row's `local_key`/`device_id`/`product_id`/`sec_key` for
-   the pairing handshake, and the advertisement's *current* MAC for the GATT
-   connect.
+   row N — use that row's `local_key`/`device_id`/`sec_key` for the pairing
+   handshake (`product_id` is not needed anywhere in the protocol itself, see
+   "Recommended scope" below), and the advertisement's *current* MAC for the
+   GATT connect.
 5. No match (wrong UTF-8 decode, or decodes but isn't in the table) → not one
    of our devices, ignore and keep scanning.
 
@@ -119,6 +120,42 @@ that device's CSV `uuid` column. Trying `MD5("ajrhf1aj")` (the CSV
 product_id string) instead produces garbage, not valid UTF-8 — confirming the
 two byte sequences are unrelated and the advertisement's own bytes are the
 only correct key source.
+
+### Independent cross-verification: github.com/MrTup1/Parkside-Bluetooth
+
+A third-party project (C++/NimBLE, targeting the identical PAPS 208 A1
+hardware, unrelated to this repo) independently arrived at the same
+advertisement-decrypt formula, which is strong external confirmation of the
+mechanism above. Its `TuyaBLEAdvertisedDeviceInfo::fromBLEAdvertisedDevice()`
+computes `digest = MD5(serviceData[1:])` and decrypts
+`manufacturerData[8:24]` with AES-CBC using that digest as key+IV — at first
+glance an "offset 8" vs. this plan's "offset 6" (`manufacturer_data[6:]`)
+discrepancy, but they're the same byte range: NimBLE's raw manufacturer-data
+buffer includes the 2-byte Tuya company ID (`0x07D0`) that `bleak` (and this
+plan's byte offsets, which assume bleak's already-stripped buffers) strips
+automatically. `8 - 2 = 6`. Confirmed by reconstructing MrTup1's full
+(unstripped) buffer from this plan's real capture above and checking
+`fullBuf[8:24] == manufacturer_data[6:]` byte-for-byte — true. **If the
+firmware reads manufacturer data from NimBLE directly (not via a bleak-like
+abstraction), use offset 8, not 6**, since NimBLE will include those 2
+company-ID bytes at the front.
+
+Two other relevant findings from the same project, worth carrying into
+firmware bring-up:
+
+- **`local_key` rotates whenever the battery is re-paired to the Lidl/Tuya
+  phone app** (and possibly under other conditions not fully pinned down by
+  that project either). A CSV export's `local_key` is a snapshot, not a
+  permanent secret — if a previously-working firmware suddenly can't
+  complete the `FUN_SENDER_PAIR` handshake with no protocol-level error,
+  suspect a stale `local_key` before suspecting a code bug. Re-export
+  `id`/`local_key` together from the cloud API (not just one), and avoid
+  opening the phone app again before testing the new key.
+- Their pairing/handshake sequence, security flag values (`0x04`
+  local-key, `0x05` session-key), GATT service/characteristic UUIDs
+  (`0x1910`/`0x2B10`/`0x2B11`), packet chunking at 20-byte MTU, and 6-type
+  KLV datapoint model all independently match what's documented below from
+  `tuya_ble.py` — no new corrections needed there, just confirmation.
 
 ## Protocol facts to carry into the C++ port (verified against source)
 
@@ -196,6 +233,28 @@ product_ids `ajrhf1aj`/`z5ztlw3k`) plus the corresponding entries across
 use that as the DP-ID reference table for the firmware rather than re-reading
 six Python files.
 
+**Known bug to carry forward, not repeat**: this repo's `sensor.py` maps dp3
+(`charge_voltage`) with no coefficient (defaults to `1.0`), so it reports the
+raw value directly as millivolts — but real captured raw values (2452-2532)
+would mean ~2.5V, physically implausible for a pack labeled "20V" (5S Li-ion
+is nominally ~18.5-21V). Cross-checked against MrTup1/Parkside-Bluetooth,
+which documents a **×8 scale factor** for this DP; `raw * 8` lands at
+19.6-20.3V across multiple real captures, matching the pack rating. The
+firmware's DP-decode table should apply this ×8 factor for dp3, not the raw
+`sensor.py` mapping. `battery_status.py` already applies this fix
+(`DCB_VOLTAGE_SCALE`).
+
+**Known open question, not yet resolved**: dp104's unit is ambiguous between
+sources. This repo's `sensor.py` calls it `discharge_to_empty_time` in
+**seconds**; MrTup1/Parkside-Bluetooth calls it `EstimatedLife` in **minutes**
+("capped at 30720"). A real captured value (29184 at 94% battery charge) is
+physically plausible as seconds (~8.1h remaining runtime) but implausible as
+minutes (~20 days) — seconds is kept as the working assumption in
+`battery_status.py`, but this is inference from one data point, not a
+confirmed spec. Resolve empirically before relying on it: capture this DP
+while a battery discharges under a known, steady load and see which unit
+tracks real elapsed/remaining time correctly.
+
 ## mbedTLS mapping (all available in Arduino-ESP32 core, no extra libraries)
 
 | Need | API |
@@ -210,9 +269,16 @@ six Python files.
 
 1. **CSV → JSON → NVS, offline, no MAC needed**: a one-time (PC-side, not
    on-device) conversion of the Tuya export CSV into a compact JSON array,
-   one object per device: `{"product_id", "uuid", "local_key", "device_id",
-   "sec_key"?, "name"?}` — omit `mac` entirely, it's not needed as shown
-   above. Store this JSON blob as a single NVS string/blob value (ESP32 NVS
+   one object per device: `{"uuid", "local_key", "device_id", "sec_key"?,
+   "name"?}` — omit `mac` entirely (not needed, as shown above), and omit
+   `product_id`/`category` too: `battery_status.py`'s own credential loader
+   found neither is read anywhere in the pairing/session/DP-decode path (both
+   are only consulted by the real HA integration to pick *UI* sensor
+   mappings) and dropped them, filling harmless placeholders instead — the
+   firmware's JSON schema should match. `sec_key` is genuinely optional
+   (omit it entirely if the CSV export doesn't have that column, same as this
+   user's export) and only switches key derivation to protocol-v2 when
+   present. Store this JSON blob as a single NVS string/blob value (ESP32 NVS
    supports blobs up to its partition size; a handful of battery entries will
    be well under any practical limit) and parse it at boot with ArduinoJson
    (already the de facto standard on this platform) into an in-memory array

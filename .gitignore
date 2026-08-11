@@ -164,3 +164,4 @@ config
 
 # Tuya IoT device credential exports (contain plaintext local_key secrets)
 batteries/*.csv
+.claude/settings.json
